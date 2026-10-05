@@ -73,11 +73,19 @@ async function pollinationsChat(messages, maxTokens) {
 }
 
 async function geminiChat(model, messages, maxTokens) {
-  const geminiModel = model === "auto" ? "gemini-2.0-flash" : String(model).replace(/^gemini\//, "");
-  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
+  const geminiModel = model === "auto" ? "gemini-2.5-flash" : String(model).replace(/^gemini\//, "");
+  const system = messages
+    .filter((m) => m.role === "system")
+    .map((m) => String(m.content || ""))
+    .join("\n");
   const contents = messages
     .filter((m) => m.role !== "system")
-    .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    .map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: String(m.content || "") }],
+    }))
+    .filter((c) => c.parts[0].text);
+  if (!contents.length) throw new Error("gemini: no content to send");
   const body = { contents };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (maxTokens) body.generationConfig = { maxOutputTokens: maxTokens };
@@ -85,7 +93,10 @@ async function geminiChat(model, messages, maxTokens) {
     `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${GEMINI_KEY}`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
   );
-  if (!r.ok) throw new Error("gemini HTTP " + r.status);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`gemini HTTP ${r.status}: ${t.slice(0, 120)}`);
+  }
   const d = await r.json();
   const text = d.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
   const u = d.usageMetadata || {};

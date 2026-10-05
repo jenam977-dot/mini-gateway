@@ -72,11 +72,39 @@ async function pollinationsChat(messages, maxTokens) {
   };
 }
 
-const GEMINI_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"];
+let GEMINI_MODEL_CACHE = null;
+
+async function geminiPickModel() {
+  if (GEMINI_MODEL_CACHE) return GEMINI_MODEL_CACHE;
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`
+    );
+    if (!r.ok) throw new Error("list models HTTP " + r.status);
+    const d = await r.json();
+    const models = (d.models || [])
+      .map((m) => m.name.replace("models/", ""))
+      .filter((n) => /flash/i.test(n) && /generateContent/i.test(
+        (d.models.find((m) => m.name.endsWith(n))?.supportedGenerationMethods || []).join(",")
+      ));
+    // Prefer the newest flash model.
+    models.sort().reverse();
+    if (models.length) {
+      GEMINI_MODEL_CACHE = models[0];
+      console.log("[gemini] auto-selected model:", GEMINI_MODEL_CACHE);
+      return GEMINI_MODEL_CACHE;
+    }
+  } catch (e) {
+    console.error("[gemini] model discovery failed:", e.message);
+  }
+  // Fallback guesses if discovery fails.
+  return "gemini-2.0-flash";
+}
 
 async function geminiChat(model, messages, maxTokens) {
   const wanted = String(model || "auto").replace(/^gemini\//, "");
-  const candidates = wanted === "auto" ? GEMINI_CANDIDATES : [wanted, ...GEMINI_CANDIDATES];
+  const preferred = wanted === "auto" ? await geminiPickModel() : wanted;
+  const candidates = [preferred, "gemini-2.0-flash", "gemini-1.5-flash"];
   const system = messages
     .filter((m) => m.role === "system")
     .map((m) => String(m.content || ""))

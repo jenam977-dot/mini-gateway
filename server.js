@@ -3,6 +3,8 @@
  *
  * Request in -> AI output out -> done. No database, no state, no snapshots.
  * OpenAI-compatible: GET /v1/models, POST /v1/chat/completions.
+ * Anthropic-compatible: POST /v1/messages (native proxy to the full gateway,
+ *   with SSE streaming passthrough and a translated fallback).
  *
  * Routing (in order):
  *  1. Full OmniRoute gateway (all 478 models) — proxied with the same key.
@@ -133,7 +135,7 @@ function send(res, code, obj) {
   res.writeHead(code, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   });
   res.end(JSON.stringify(obj));
@@ -156,11 +158,99 @@ function readBody(req) {
 
 function authorized(req) {
   if (!API_KEY) return true;
-  return (req.headers.authorization || "").trim() === "Bearer " + API_KEY;
+  const auth = (req.headers.authorization || "").trim();
+  const xkey = (req.headers["x-api-key"] || "").trim();
+  // Claude Code sends the token as x-api-key; browsers/apps use Bearer.
+  return auth === "Bearer " + API_KEY || xkey === API_KEY;
 }
 
 function clientKey(req) {
-  return ((req.headers.authorization || "").trim().replace(/^Bearer\s+/i, ""));
+  const auth = (req.headers.authorization || "").trim();
+  if (/^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "");
+  return (req.headers["x-api-key"] || "").trim();
+}
+
+// ---------- anthropic /v1/messages ----------
+
+// Primary path: the full gateway speaks Anthropic natively — proxy body as-is.
+async function upstreamMessages(clientKey, body, anthropicVersion) {
+  const r = await fetch(UPSTREAM + "/v1/messages", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + clientKey,
+      "Content-Type": "application/json",
+      "anthropic-version": anthropicVersion || "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+  if (r.status === 503) {
+    const t = await r.text();
+    throw new Error("upstream_unavailable: " + t.slice(0, 100));
+  }
+  if (!r.ok) throw new Error("upstream HTTP " + r.status);
+  return r;
+}
+
+// Fallback path: translate Anthropic messages -> OpenAI chat, route via the
+// free backends, translate the answer back to an Anthropic message object.
+function anthropicToOpenAI(body) {
+  const msgs = [];
+  if (body.system) {
+    const sys = Array.isArray(body.system)
+      ? body.system.filter((b) => b.type === "text").map((b) => b.text).join("\n")
+      : String(body.system);
+    if (sys) msgs.push({ role: "system", content: sys });
+  }
+  for (const m of body.messages || []) {
+    let text = "";
+    if (typeof m.content === "string") text = m.content;
+    else if (Array.isArray(m.content)) {
+      text = m.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text || "")
+        .join("\n");
+      const tools = m.content.filter((b) => b.type === "tool_use" || b.type === "tool_result");
+      if (tools.length) text += "\n[tool calls not supported on fallback backend]";
+    }
+    msgs.push({ role: m.role === "assistant" ? "assistant" : "user", content: text });
+  }
+  return msgs;
+}
+
+function openAIToAnthropic(text, model, promptTokens, completionTokens) {
+  return {
+    id: "msg_mini_" + Date.now().toString(36),
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: promptTokens, output_tokens: completionTokens },
+  };
+}
+
+async function routeMessages(clientKey, body) {
+  const errors = [];
+  try {
+    const r = await upstreamMessages(
+      clientKey, body, undefined
+    );
+    return { proxied: r };
+  } catch (e) {
+    errors.push("upstream: " + e.message);
+    console.error("[messages]", e.message);
+  }
+  try {
+    const oai = anthropicToOpenAI(body);
+    const { text, model, promptTokens, completionTokens } = await routeChat(
+      clientKey, body.model || "auto", oai, body.max_tokens
+    );
+    return { json: openAIToAnthropic(text, model, promptTokens, completionTokens) };
+  } catch (e) {
+    errors.push("fallback: " + e.message);
+  }
+  throw new Error(errors.join(" | "));
 }
 
 const FALLBACK_MODELS = [
@@ -176,7 +266,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     });
     return res.end();
@@ -225,6 +315,39 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error("[chat] all backends failed:", e.message);
       return send(res, 502, { error: { message: "All backends failed: " + e.message } });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/messages") {
+    try {
+      const body = await readBody(req);
+      const anthropicVersion = req.headers["anthropic-version"] || "2023-06-01";
+      if (body.stream) {
+        // Streaming: pipe the upstream SSE straight through.
+        try {
+          const r = await upstreamMessages(key, body, anthropicVersion);
+          res.writeHead(r.status, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+          });
+          for await (const chunk of r.body) res.write(chunk);
+          return res.end();
+        } catch (e) {
+          console.error("[messages] stream upstream failed:", e.message);
+          return send(res, 502, { type: "error", error: { type: "api_error", message: e.message } });
+        }
+      }
+      const out = await routeMessages(key, body);
+      if (out.proxied) {
+        const d = await out.proxied.json();
+        return send(res, out.proxied.status, d);
+      }
+      return send(res, 200, out.json);
+    } catch (e) {
+      console.error("[messages] all backends failed:", e.message);
+      return send(res, 502, { type: "error", error: { type: "api_error", message: "All backends failed: " + e.message } });
     }
   }
 

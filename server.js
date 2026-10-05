@@ -17,8 +17,8 @@
  *   PORT        - set by Render automatically
  */
 const http = require("http");
-
-const API_KEY = (process.env.API_KEY || "").trim();
+// API_KEY is stored base64-encoded in the env to avoid paste mangling.
+const API_KEY = Buffer.from((process.env.API_KEY || "").trim(), "base64").toString("utf8").trim();
 const UPSTREAM = (process.env.UPSTREAM || "https://omniroute-boot.onrender.com").replace(/\/$/, "");
 const GEMINI_KEY = (process.env.GEMINI_KEY || "").trim();
 const PORT = parseInt(process.env.PORT || "3000", 10);

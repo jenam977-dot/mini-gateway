@@ -28,11 +28,17 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 
 // ---------- backends ----------
 
-async function upstreamChat(key, model, messages, maxTokens) {
+async function upstreamChat(key, model, messages, maxTokens, tools) {
   const r = await fetch(UPSTREAM + "/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens || 2000, stream: false }),
+    body: JSON.stringify({
+      model,
+      messages,
+      max_tokens: maxTokens || 2000,
+      stream: false,
+      ...(tools ? { tools } : {}),
+    }),
   });
   if (r.status === 503) {
     const t = await r.text();
@@ -43,6 +49,7 @@ async function upstreamChat(key, model, messages, maxTokens) {
   const c = d.choices?.[0] || {};
   return {
     text: c.message?.content || "",
+    toolCalls: c.message?.tool_calls || [],
     model: d.model || model,
     promptTokens: d.usage?.prompt_tokens || 0,
     completionTokens: d.usage?.completion_tokens || 0,
@@ -90,11 +97,11 @@ async function geminiChat(model, messages, maxTokens) {
   };
 }
 
-async function routeChat(clientKey, model, messages, maxTokens) {
+async function routeChat(clientKey, model, messages, maxTokens, tools) {
   const errors = [];
   // 1. Full gateway (all models)
   try {
-    return await upstreamChat(clientKey, model, messages, maxTokens);
+    return await upstreamChat(clientKey, model, messages, maxTokens, tools);
   } catch (e) {
     errors.push("upstream: " + e.message);
     console.error("[route]", e.message);
@@ -191,8 +198,8 @@ async function upstreamMessages(clientKey, body, anthropicVersion) {
   return r;
 }
 
-// Fallback path: translate Anthropic messages -> OpenAI chat, route via the
-// free backends, translate the answer back to an Anthropic message object.
+// Fallback path: translate Anthropic messages -> OpenAI chat (with tools),
+// route via the working chat-completions backends, translate back.
 function anthropicToOpenAI(body) {
   const msgs = [];
   if (body.system) {
@@ -202,51 +209,152 @@ function anthropicToOpenAI(body) {
     if (sys) msgs.push({ role: "system", content: sys });
   }
   for (const m of body.messages || []) {
-    let text = "";
-    if (typeof m.content === "string") text = m.content;
-    else if (Array.isArray(m.content)) {
-      text = m.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text || "")
-        .join("\n");
-      const tools = m.content.filter((b) => b.type === "tool_use" || b.type === "tool_result");
-      if (tools.length) text += "\n[tool calls not supported on fallback backend]";
+    if (m.role === "user" && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b.type === "tool_result") {
+          msgs.push({
+            role: "tool",
+            tool_call_id: b.tool_use_id,
+            content: typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? ""),
+          });
+        } else if (b.type === "text" && b.text) {
+          msgs.push({ role: "user", content: b.text });
+        } else if (b.type === "image") {
+          msgs.push({ role: "user", content: "[image omitted on fallback backend]" });
+        }
+      }
+      continue;
     }
-    msgs.push({ role: m.role === "assistant" ? "assistant" : "user", content: text });
+    let text = "";
+    const toolCalls = [];
+    const blocks = Array.isArray(m.content)
+      ? m.content
+      : [{ type: "text", text: typeof m.content === "string" ? m.content : "" }];
+    for (const b of blocks) {
+      if (b.type === "text") text += b.text || "";
+      else if (b.type === "tool_use")
+        toolCalls.push({
+          id: b.id,
+          type: "function",
+          function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+        });
+    }
+    const msg = { role: "assistant", content: text || null };
+    if (toolCalls.length) msg.tool_calls = toolCalls;
+    msgs.push(msg);
   }
-  return msgs;
+  const tools = (body.tools || []).map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description || "",
+      parameters: t.input_schema || { type: "object", properties: {} },
+    },
+  }));
+  return { messages: msgs, tools: tools.length ? tools : undefined };
 }
 
-function openAIToAnthropic(text, model, promptTokens, completionTokens) {
+function openAIToAnthropic(text, toolCalls, model, promptTokens, completionTokens) {
+  const content = [];
+  if (text) content.push({ type: "text", text });
+  for (const tc of toolCalls || []) {
+    let input = {};
+    try {
+      input = JSON.parse(tc.function?.arguments || "{}");
+    } catch (_) {}
+    content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "tool", input });
+  }
   return {
     id: "msg_mini_" + Date.now().toString(36),
     type: "message",
     role: "assistant",
-    model,
-    content: [{ type: "text", text }],
-    stop_reason: "end_turn",
+    model: model || "auto",
+    content,
+    stop_reason: content.some((c) => c.type === "tool_use") ? "tool_use" : "end_turn",
     stop_sequence: null,
-    usage: { input_tokens: promptTokens, output_tokens: completionTokens },
+    usage: { input_tokens: promptTokens || 0, output_tokens: completionTokens || 0 },
   };
+}
+
+// Synthesize Anthropic SSE events from a translated (non-stream) answer,
+// so streaming clients keep working when the native upstream stream is down.
+function anthropicSSE(res, msg) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send("message_start", {
+    type: "message_start",
+    message: {
+      id: msg.id, type: "message", role: "assistant", content: [],
+      model: msg.model, stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: msg.usage.input_tokens, output_tokens: 0 },
+    },
+  });
+  let idx = 0;
+  for (const b of msg.content) {
+    if (b.type === "text") {
+      send("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
+      // Emit in small chunks to look like a real stream.
+      const t = b.text;
+      for (let i = 0; i < t.length; i += 60) {
+        send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: t.slice(i, i + 60) } });
+      }
+      send("content_block_stop", { type: "content_block_stop", index: idx });
+      idx++;
+    } else if (b.type === "tool_use") {
+      send("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "tool_use", id: b.id, name: b.name, input: {} } });
+      const js = JSON.stringify(b.input);
+      for (let i = 0; i < js.length; i += 60) {
+        send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: js.slice(i, i + 60) } });
+      }
+      send("content_block_stop", { type: "content_block_stop", index: idx });
+      idx++;
+    }
+  }
+  send("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: msg.stop_reason, stop_sequence: null },
+    usage: { output_tokens: msg.usage.output_tokens },
+  });
+  send("message_stop", { type: "message_stop" });
+  res.end();
+}
+
+function upstreamAnswerUsable(d) {
+  if (!d || d.type !== "message" || !Array.isArray(d.content)) return false;
+  // Strip the upstream's empty-response placeholder text; it's noise.
+  d.content = d.content.filter(
+    (b) => !(b.type === "text" && (!b.text || b.text === "(empty response)"))
+  );
+  const hasTool = d.content.some((b) => b.type === "tool_use");
+  const text = d.content.filter((b) => b.type === "text").map((b) => b.text || "").join("");
+  return hasTool || !!text;
 }
 
 async function routeMessages(clientKey, body) {
   const errors = [];
+  // 1. Native proxy — but only trust it if the answer has real content.
   try {
-    const r = await upstreamMessages(
-      clientKey, body, undefined
-    );
-    return { proxied: r };
+    const r = await upstreamMessages(clientKey, body, undefined);
+    const d = await r.json();
+    if (upstreamAnswerUsable(d)) return { status: r.status, json: d };
+    errors.push("upstream: empty response");
   } catch (e) {
     errors.push("upstream: " + e.message);
     console.error("[messages]", e.message);
   }
+  // 2. Translated fallback via the working chat-completions backends.
   try {
     const oai = anthropicToOpenAI(body);
-    const { text, model, promptTokens, completionTokens } = await routeChat(
-      clientKey, body.model || "auto", oai, body.max_tokens
+    const { text, toolCalls, model, promptTokens, completionTokens } = await routeChat(
+      clientKey, body.model || "auto", oai.messages, body.max_tokens, oai.tools
     );
-    return { json: openAIToAnthropic(text, model, promptTokens, completionTokens) };
+    if (!text && !(toolCalls || []).length) throw new Error("fallback returned empty");
+    return { status: 200, json: openAIToAnthropic(text, toolCalls, model, promptTokens, completionTokens) };
   } catch (e) {
     errors.push("fallback: " + e.message);
   }
@@ -322,8 +430,9 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readBody(req);
       const anthropicVersion = req.headers["anthropic-version"] || "2023-06-01";
+      const out = await routeMessages(key, body);
       if (body.stream) {
-        // Streaming: pipe the upstream SSE straight through.
+        // Try the native upstream SSE first.
         try {
           const r = await upstreamMessages(key, body, anthropicVersion);
           res.writeHead(r.status, {
@@ -335,16 +444,13 @@ const server = http.createServer(async (req, res) => {
           for await (const chunk of r.body) res.write(chunk);
           return res.end();
         } catch (e) {
-          console.error("[messages] stream upstream failed:", e.message);
-          return send(res, 502, { type: "error", error: { type: "api_error", message: e.message } });
+          // Native stream unavailable/broken: synthesize SSE from the
+          // translated answer so streaming clients keep working.
+          console.error("[messages] stream upstream failed, synthesizing SSE:", e.message);
+          return anthropicSSE(res, out.json);
         }
       }
-      const out = await routeMessages(key, body);
-      if (out.proxied) {
-        const d = await out.proxied.json();
-        return send(res, out.proxied.status, d);
-      }
-      return send(res, 200, out.json);
+      return send(res, out.status, out.json);
     } catch (e) {
       console.error("[messages] all backends failed:", e.message);
       return send(res, 502, { type: "error", error: { type: "api_error", message: "All backends failed: " + e.message } });

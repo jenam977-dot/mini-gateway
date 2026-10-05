@@ -19,11 +19,13 @@ free -h | grep Swap
 echo "=== 3. Installing Docker ==="
 if ! command -v docker &> /dev/null; then
   sudo apt update -qq
-  sudo apt install -y -qq docker.io docker-compose-plugin curl
+  # docker.io + docker-compose (v1) are in Ubuntu's repos;
+  # docker-compose-plugin is only in Docker's official repo.
+  sudo apt install -y -qq docker.io docker-compose curl
   sudo systemctl enable --now docker
 fi
 docker --version
-docker compose version
+docker-compose --version
 
 echo "=== 4. Downloading OmniRoute self-host files ==="
 mkdir -p ~/omniroute && cd ~/omniroute
@@ -48,7 +50,7 @@ fi
 grep -E "^(REQUIRE_API_KEY|APP_BIND_HOST)=" .env
 
 echo "=== 6. Starting OmniRoute ==="
-sudo docker compose -f docker-compose.selfhost.yml up -d
+sudo docker-compose -f docker-compose.selfhost.yml up -d
 sleep 10
 sudo docker ps --format "table {{.Names}}\t{{.Status}}"
 

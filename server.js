@@ -72,8 +72,11 @@ async function pollinationsChat(messages, maxTokens) {
   };
 }
 
+const GEMINI_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"];
+
 async function geminiChat(model, messages, maxTokens) {
-  const geminiModel = model === "auto" ? "gemini-2.5-flash" : String(model).replace(/^gemini\//, "");
+  const wanted = String(model || "auto").replace(/^gemini\//, "");
+  const candidates = wanted === "auto" ? GEMINI_CANDIDATES : [wanted, ...GEMINI_CANDIDATES];
   const system = messages
     .filter((m) => m.role === "system")
     .map((m) => String(m.content || ""))
@@ -89,14 +92,32 @@ async function geminiChat(model, messages, maxTokens) {
   const body = { contents };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (maxTokens) body.generationConfig = { maxOutputTokens: maxTokens };
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${GEMINI_KEY}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-  );
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`gemini HTTP ${r.status}: ${t.slice(0, 120)}`);
+  const errors = [];
+  for (const geminiModel of candidates) {
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${GEMINI_KEY}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      );
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(`gemini ${geminiModel} HTTP ${r.status}: ${t.slice(0, 100)}`);
+      }
+      const d = await r.json();
+      const text = d.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+      if (!text) throw new Error(`gemini ${geminiModel}: empty response`);
+      const u = d.usageMetadata || {};
+      return {
+        text,
+        model: "gemini/" + geminiModel,
+        promptTokens: u.promptTokenCount || 0,
+        completionTokens: u.candidatesTokenCount || 0,
+      };
+    } catch (e) {
+      errors.push(e.message);
+    }
   }
+  throw new Error(errors.join(" | "));
   const d = await r.json();
   const text = d.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
   const u = d.usageMetadata || {};
